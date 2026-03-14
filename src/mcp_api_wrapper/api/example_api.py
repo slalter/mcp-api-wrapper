@@ -5,10 +5,8 @@ this would be your actual API - the MCP server just provides
 discovery, auth, and docs on top of it.
 """
 
-from __future__ import annotations
-
 from datetime import datetime, timezone
-from typing import Annotated
+from typing import Annotated, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
@@ -18,8 +16,8 @@ from mcp_api_wrapper.config import Settings, get_settings
 
 
 def create_example_api(
-    settings: Settings | None = None,
-    token_service: TokenService | None = None,
+    settings: Optional[Settings] = None,
+    token_service: Optional[TokenService] = None,
 ) -> FastAPI:
     """Create the example API application."""
     settings = settings or get_settings()
