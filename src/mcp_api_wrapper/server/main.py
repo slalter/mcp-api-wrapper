@@ -1,9 +1,10 @@
-"""Thin MCP server with exactly 3 tools.
+"""Thin MCP server with 4 tools.
 
-This is the stable layer that never changes. The 3 tools provide:
+The stable layer provides:
 1. getAPIEndpoints - Discover what the API can do
 2. getAuthToken - Get authenticated for API access
-3. getDocumentation - Get full API docs
+3. getDocumentation - Get full API docs (URL)
+4. searchDocumentation - Semantically search API docs (RAG)
 
 All real work happens through the API that sits behind these tools.
 """
@@ -11,7 +12,6 @@ All real work happens through the API that sits behind these tools.
 from __future__ import annotations
 
 import json
-import sys
 from datetime import datetime, timezone
 
 from mcp.server import Server
@@ -22,15 +22,18 @@ from mcp_api_wrapper.api.registry import EndpointRegistry
 from mcp_api_wrapper.auth.token_service import TokenService
 from mcp_api_wrapper.config import Settings, get_settings
 from mcp_api_wrapper.queue.message_queue import InMemoryMessageQueue
+from mcp_api_wrapper.rag.doc_index import DocumentationIndex
+from mcp_api_wrapper.rag.embeddings import HashEmbeddingProvider, OpenAIEmbeddingProvider
 from mcp_api_wrapper.schemas import (
-    APIEvolutionRequest,
     AuthRequest,
+    DocSearchResult,
     DocumentationResponse,
+    SearchDocumentationResponse,
 )
 
 
 def create_server(settings: Settings | None = None) -> tuple[Server, _ServerState]:
-    """Create the MCP server with the 3 thin tools.
+    """Create the MCP server with the 4 thin tools.
 
     Returns (server, state) so the caller can inject dependencies.
     """
@@ -40,7 +43,7 @@ def create_server(settings: Settings | None = None) -> tuple[Server, _ServerStat
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
-        return [
+        tools = [
             Tool(
                 name="getAPIEndpoints",
                 description=(
@@ -105,6 +108,46 @@ def create_server(settings: Settings | None = None) -> tuple[Server, _ServerStat
             ),
         ]
 
+        if state.settings.rag_enabled:
+            tools.append(
+                Tool(
+                    name="searchDocumentation",
+                    description=(
+                        "Semantically search the API documentation. Returns "
+                        "relevant chunks ranked by relevance instead of the "
+                        "full spec. Use this to find specific endpoints, "
+                        "parameters, or concepts without downloading everything."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Natural language search query",
+                            },
+                            "top_k": {
+                                "type": "integer",
+                                "description": "Max results to return (1-20)",
+                                "default": 5,
+                                "minimum": 1,
+                                "maximum": 20,
+                            },
+                            "section": {
+                                "type": "string",
+                                "description": (
+                                    "Optional section filter "
+                                    "(e.g. 'paths./users.get', 'schemas.User')"
+                                ),
+                            },
+                        },
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                )
+            )
+
+        return tools
+
     @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, object]) -> list[TextContent]:
         if name == "getAPIEndpoints":
@@ -113,6 +156,8 @@ def create_server(settings: Settings | None = None) -> tuple[Server, _ServerStat
             return await _handle_get_auth_token(state, arguments)
         elif name == "getDocumentation":
             return await _handle_get_documentation(state, arguments)
+        elif name == "searchDocumentation":
+            return await _handle_search_documentation(state, arguments)
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -182,6 +227,67 @@ async def _handle_get_documentation(
     return [TextContent(type="text", text=response.model_dump_json(indent=2))]
 
 
+async def _handle_search_documentation(
+    state: _ServerState, arguments: dict[str, object]
+) -> list[TextContent]:
+    """Handle searchDocumentation tool call."""
+    if not state.settings.rag_enabled:
+        return [
+            TextContent(
+                type="text",
+                text=json.dumps({"error": "RAG search is disabled in server configuration"}),
+            )
+        ]
+
+    if state.doc_index is None:
+        return [
+            TextContent(
+                type="text",
+                text=json.dumps({"error": "Documentation index not initialized"}),
+            )
+        ]
+
+    query = str(arguments.get("query", ""))
+    if not query.strip():
+        return [
+            TextContent(
+                type="text",
+                text=json.dumps({"error": "query is required"}),
+            )
+        ]
+
+    raw_top_k = arguments.get("top_k", state.settings.rag_default_top_k)
+    try:
+        top_k = max(1, min(20, int(str(raw_top_k))))
+    except (ValueError, TypeError):
+        top_k = state.settings.rag_default_top_k
+
+    section = arguments.get("section")
+    section_str = str(section) if section is not None else None
+
+    hits = state.doc_index.search(
+        query=query,
+        top_k=top_k,
+        min_score=state.settings.rag_min_score,
+        section_filter=section_str,
+    )
+
+    response = SearchDocumentationResponse(
+        results=[
+            DocSearchResult(
+                content=hit.chunk.content,
+                score=round(hit.score, 4),
+                source=hit.chunk.source,
+                section=hit.chunk.section,
+            )
+            for hit in hits
+        ],
+        total_chunks_indexed=state.doc_index.chunk_count,
+        query=query,
+    )
+    return [TextContent(type="text", text=response.model_dump_json(indent=2))]
+
+
 class _ServerState:
     """Holds shared state for the MCP server tools."""
 
@@ -190,6 +296,24 @@ class _ServerState:
         self.registry = EndpointRegistry(settings)
         self.token_service = TokenService(settings)
         self.message_queue = InMemoryMessageQueue()
+        self.doc_index: DocumentationIndex | None = None
+
+        if settings.rag_enabled:
+            self.doc_index = _create_doc_index(settings)
+
+
+def _create_doc_index(settings: Settings) -> DocumentationIndex:
+    """Create a DocumentationIndex from settings."""
+    if settings.rag_embedding_provider == "openai" and settings.rag_openai_api_key:
+        embedder = OpenAIEmbeddingProvider(api_key=settings.rag_openai_api_key)
+    else:
+        embedder = HashEmbeddingProvider()
+
+    return DocumentationIndex(
+        embedder=embedder,
+        max_chunk_size=settings.rag_max_chunk_size,
+        chunk_overlap=settings.rag_chunk_overlap,
+    )
 
 
 async def _run_server() -> None:

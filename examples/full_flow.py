@@ -38,10 +38,12 @@ from mcp_api_wrapper.schemas import (
     EvolutionRequestStatus,
     HTTPMethod,
 )
+from mcp_api_wrapper.rag.types import DocFormat
 from mcp_api_wrapper.server.main import (
     _handle_get_auth_token,
     _handle_get_documentation,
     _handle_get_endpoints,
+    _handle_search_documentation,
     _ServerState,
 )
 
@@ -132,6 +134,33 @@ async def run_example() -> None:
         print(f"Docs URL:     {docs_data['docs_url']}")
         print(f"Format:       {docs_data['format']}")
         print(f"Version:      {docs_data['version']}")
+
+        # ── Phase 3.5: Search Documentation via RAG ─────────────────────
+        banner("PHASE 3.5: Search Documentation (via MCP RAG)")
+
+        # Ingest the OpenAPI spec into the RAG index
+        if state.doc_index is not None:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(f"{settings.api_base_url}/docs/openapi.json")
+                spec_content = resp.text
+            chunk_count = state.doc_index.ingest(
+                spec_content, source="openapi.json", doc_format=DocFormat.OPENAPI
+            )
+            print(f"Indexed {chunk_count} chunks from OpenAPI spec")
+
+            # Search for user-related documentation
+            result = await _handle_search_documentation(
+                state, {"query": "how to list users", "top_k": 3}
+            )
+            search_data = json.loads(result[0].text)
+            print(f"\nSearch: '{search_data['query']}'")
+            print(f"Total chunks indexed: {search_data['total_chunks_indexed']}")
+            print(f"Results ({len(search_data['results'])}):")
+            for r in search_data["results"]:
+                preview = r["content"][:80].replace("\n", " ")
+                print(f"  [{r['score']:.3f}] {r['section']:30s} {preview}...")
+        else:
+            print("RAG disabled, skipping documentation search")
 
         # ── Phase 4: Direct API Calls (bypassing MCP!) ────────────────────
         banner("PHASE 4: Direct API Calls (Bearer Token, NO MCP)")
@@ -227,7 +256,8 @@ async def run_example() -> None:
         # ── Done ───────────────────────────────────────────────────────────
         banner("COMPLETE: Full MCP-as-API-Wrapper Flow Demonstrated")
         print("Key takeaways:")
-        print("  • MCP server exposed only 3 tools (never changed)")
+        print("  • MCP server exposed 4 tools (3 original + searchDocumentation)")
+        print("  • searchDocumentation uses RAG to find relevant doc chunks")
         print("  • Auth was handled at the API layer, not MCP")
         print("  • Client made direct HTTP calls with Bearer token")
         print("  • API evolved dynamically via agent-to-agent queue")

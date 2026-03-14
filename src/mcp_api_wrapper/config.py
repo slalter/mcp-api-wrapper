@@ -27,6 +27,15 @@ class Settings(BaseSettings):
     queue_backend: str = "memory"  # "memory" | "redis"
     redis_url: str = "redis://localhost:6379/0"
 
+    # RAG configuration
+    rag_enabled: bool = True
+    rag_embedding_provider: str = "hash"  # "hash" | "openai"
+    rag_openai_api_key: str = ""
+    rag_max_chunk_size: int = 1500
+    rag_chunk_overlap: int = 200
+    rag_default_top_k: int = 5
+    rag_min_score: float = 0.0
+
     model_config = {"env_prefix": "MCP_WRAPPER_"}
 
 

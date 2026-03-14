@@ -92,6 +92,37 @@ class DocumentationResponse(BaseModel):
     changelog_url: str = Field(default="", description="URL to changelog / diff from last version")
 
 
+# ── Documentation Search (RAG) ────────────────────────────────────────────────
+
+
+class SearchDocumentationRequest(BaseModel):
+    """Request to searchDocumentation tool."""
+
+    query: str = Field(description="Natural language search query")
+    top_k: int = Field(default=5, ge=1, le=20, description="Max results to return")
+    section: str | None = Field(
+        default=None,
+        description="Filter results to a specific section (e.g. 'paths./users.get')",
+    )
+
+
+class DocSearchResult(BaseModel):
+    """A single documentation search result."""
+
+    content: str = Field(description="Matched documentation chunk")
+    score: float = Field(description="Relevance score (0-1)")
+    source: str = Field(description="Source document identifier")
+    section: str = Field(description="Section within the document")
+
+
+class SearchDocumentationResponse(BaseModel):
+    """Response from searchDocumentation tool."""
+
+    results: list[DocSearchResult] = Field(description="Ranked search results")
+    total_chunks_indexed: int = Field(description="Total chunks in the index")
+    query: str = Field(description="The original search query")
+
+
 # ── Message Queue (Agent-to-Agent) ─────────────────────────────────────────────
 
 
